@@ -78,6 +78,53 @@ def handshake(req: HandshakeReq, request: Request):
     return ok_env({"challenge_id": challenge_id, "server_nonce": server_nonce, "ttl": ttl})
 
 
+def _authed_session(conn, request: Request):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise ApiError(401, "auth_failed", "missing token")
+    token = auth[7:]
+    sess = conn.execute(
+        "SELECT * FROM sessions WHERE token_hash=?", (security.hash_token(token),)
+    ).fetchone()
+    now = int(time.time())
+    if sess is None or sess["revoked"] or now >= sess["expires_at"]:
+        raise ApiError(401, "auth_failed", "invalid session")
+    return sess
+
+
+@router.get("/license")
+def license_status(request: Request):
+    with db.db() as conn:
+        sess = _authed_session(conn, request)
+        k = conn.execute("SELECT * FROM license_keys WHERE id=?", (sess["key_id"],)).fetchone()
+        prod = conn.execute("SELECT slug FROM products WHERE id=?", (k["product_id"],)).fetchone()
+        data = {"product": prod["slug"], "status": k["status"], "expires_at": k["expires_at"],
+                "hwid": k["hwid"], "hwid_reset_count": k["hwid_reset_count"]}
+    return ok_env(data)
+
+
+@router.post("/auth/heartbeat")
+def heartbeat(request: Request):
+    with db.db() as conn:
+        sess = _authed_session(conn, request)
+        k = conn.execute("SELECT * FROM license_keys WHERE id=?", (sess["key_id"],)).fetchone()
+        if k["status"] == "banned":
+            raise ApiError(403, "banned", "key banned")
+        if lic.is_expired(k, int(time.time())):
+            conn.execute("UPDATE license_keys SET status='expired' WHERE id=?", (k["id"],))
+            raise ApiError(403, "expired", "license expired")
+        exp = k["expires_at"]
+    return ok_env({"valid": True, "key_expires_at": exp})
+
+
+@router.delete("/auth/session")
+def logout(request: Request):
+    with db.db() as conn:
+        sess = _authed_session(conn, request)
+        conn.execute("UPDATE sessions SET revoked=1 WHERE id=?", (sess["id"],))
+    return ok_env({"revoked": True})
+
+
 @router.post("/auth/verify")
 def verify(req: VerifyReq, request: Request):
     ip = _client_ip(request)
