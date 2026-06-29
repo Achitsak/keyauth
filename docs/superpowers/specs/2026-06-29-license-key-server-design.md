@@ -24,6 +24,8 @@ Build a hardened license-key server that issues, validates, and manages subscrip
 | Admin auth | **Single admin login** (seeded from env) |
 | Logging / visibility | **Web dashboard + Discord webhook** alerts |
 | Trust/anti-tamper model | **B — Challenge-response + server-gated payload** (HMAC signing as a layer) |
+| Configuration | **No hardcoding.** Every threshold/secret/TTL/cooldown is config-driven (env defaults + per-product DB overrides + runtime `settings` table). Tuning never requires a code change. |
+| Client experience | Client stays **thin, simple, and stable.** All detection/intelligence is server-side; the client only signs + sends. Protocol is resilient (retry/backoff, clear errors) and HWID is computed from **stable** signals so legit users are never locked out. |
 
 ## 3. Threat model & defenses
 
@@ -34,6 +36,7 @@ This is the core of the system. Each row is a property the implementation and te
 | **Replay** of a captured valid request | Per-request **nonce + timestamp window (±30s)**; server issues a **single-use challenge** that must be answered; used client nonces cached and rejected within the window |
 | **Forge / tamper** with request fields | **HMAC-SHA256** over the canonical request, keyed by the per-product app secret; signature mismatch → reject |
 | **Spoof / rotate HWID** to bypass the lock | Key binds to first HWID seen at activation; any mismatch is **rejected + logged as a clone attempt + Discord alert**; HWID changes rate-limited; heuristics flag "many HWIDs on one key" and "one HWID across many keys" |
+| **Clone HWID** (spoof to *match* a real key's HWID) | Cannot be *prevented* (HWID is client-asserted) so it is **neutralized**: **one active session per key** → a cloned HWID cannot be used in parallel; **concurrent-use / impossible-travel / IP-velocity detection** flags or bans the key. See §7. |
 | **Brute-force / enumerate keys** | ~100-bit random keys; **rate-limit + lockout** per IP and per key+HWID; constant-time comparison; coarse error reasons to avoid an oracle |
 | **Bypass the license check entirely** (cracked client) | The product payload is **encrypted and delivered ONLY through an authenticated session**. A client that skips auth never receives the product. This is the real anti-crack leverage. |
 | **Steal / hijack a session token** | Tokens are random 256-bit, **stored hashed server-side**, short TTL, bound to HWID+IP, and **instantly revocable** by admin |
@@ -55,6 +58,7 @@ This is the core of the system. Each row is a property the implementation and te
 - **used_nonces** — `nonce`, `seen_at` (rows pruned once past the timestamp window)
 - **audit_logs** — `id`, `ts`, `event_type`, `key_id` (nullable), `hwid`, `ip`, `severity`, `detail_json`
 - **payloads** — `id`, `product_id` (FK), `resource_slug`, `ciphertext`, `nonce`, `created_at`
+- **settings** — `key` (unique), `value`, `updated_at` — runtime-tunable config (detection thresholds, TTLs, cooldowns, rate limits). Seeded from env defaults on first boot, editable by admin. **No threshold is hardcoded in code** — code reads from here (falling back to env defaults).
 
 Indexes: unique on `license_keys.key_hash`, `products.slug`, `admins.username`, `sessions.token_hash`; lookup indexes on `audit_logs(ts)`, `challenges(expires_at)`, `used_nonces(seen_at)`.
 
@@ -65,31 +69,62 @@ Indexes: unique on `license_keys.key_hash`, `products.slug`, `admins.username`, 
 - **Activation-based timer:** the subscription clock starts at **first successful auth**, not at creation, so unsold keys do not burn time. On first auth: bind HWID, set `activated_at = now`, `expires_at = now + duration_seconds`, status → `active`.
 - **State machine:** `unused → active → expired`. Admin may set `banned` from any state. Expiry is evaluated on every auth and heartbeat.
 
-## 6. Client protocol (Model B — challenge-response + gated payload)
+## 6. Client API (Model B — challenge-response + gated payload)
 
-All client requests are signed: `sig = HMAC_SHA256(product.app_secret, canonical_request)`.
+Transport is plain **HTTPS + JSON + HMAC-SHA256** — deliberately language-agnostic so the Python, Go, and Node clients can each implement it with only their standard library (no exotic dependencies). All client requests are signed: `sig = HMAC_SHA256(product.app_secret, canonical_request)`.
 
-1. **`POST /api/v1/handshake`** — body `{product, key, hwid, nonce, ts, sig}`. Server verifies sig, timestamp window, and nonce-unused; looks up the key; returns `{challenge_id, server_nonce, ttl}`. A short-lived single-use `challenges` row is created.
-2. **`POST /api/v1/auth`** — body `{challenge_id, key, hwid, ts, answer_sig}` where `answer_sig = HMAC(app_secret, challenge_id|server_nonce|key|hwid|ts)`. Server validates: challenge exists/unexpired/unused; signature; key active/unexpired/product-match/not-banned; HWID bound-or-bindable. On success: bind/confirm HWID, activate if first use, issue a **session token**, mark challenge used, write `login` audit log, fire Discord notification.
-3. **`GET /api/v1/payload/{product}/{resource}`** — requires a valid session token. Server decrypts the `payloads` row and returns the protected content. **This is the only path to the product.**
-4. **`POST /api/v1/hwid/reset`** — signed. If `now - last_hwid_reset_at >= cooldown`, unbind HWID, increment `hwid_reset_count`, set `last_hwid_reset_at`, log + Discord alert. Otherwise reject with remaining cooldown time.
-5. **`GET /api/v1/heartbeat`** — requires session; revalidates expiry/ban/revocation so a revoked or expired session stops working live.
+**Path layout — versioned and grouped by resource (the "pro" surface):**
 
-Error responses use coarse, stable codes (`invalid_request`, `auth_failed`, `expired`, `hwid_mismatch`, `rate_limited`, `banned`) — enough for client UX without becoming an enumeration oracle.
+| Method | Path | Purpose |
+|---|---|---|
+| `GET`  | `/api/v1/meta/health` | Liveness check |
+| `GET`  | `/api/v1/meta/time` | Server time — clients sign with this to avoid clock-skew lockouts (stability) |
+| `POST` | `/api/v1/auth/handshake` | Start auth, receive a single-use challenge |
+| `POST` | `/api/v1/auth/verify` | Answer the challenge → receive a **session token** (the core "validate license" call) |
+| `POST` | `/api/v1/auth/heartbeat` | Keepalive + live re-validation (expiry/ban/revocation) |
+| `DELETE` | `/api/v1/auth/session` | Client-initiated logout / release the seat |
+| `GET`  | `/api/v1/license` | Status of the authenticated key (product, expiry, hwid, resets left) |
+| `POST` | `/api/v1/license/hwid/reset` | Self-reset HWID (cooldown enforced) |
+| `GET`  | `/api/v1/files/{product}/{resource}` | **Gated payload** — decrypted & served only with a valid session. The only path to the product. |
 
-## 7. HWID / anti-clone logic
+**Flow:**
+1. `auth/handshake` `{product, key, hwid, nonce, ts, sig}` → verify sig/ts-window/nonce-unused, look up key → return `{challenge_id, server_nonce, ttl}` (creates a short-lived single-use `challenges` row).
+2. `auth/verify` `{challenge_id, key, hwid, ts, answer_sig}`, where `answer_sig = HMAC(app_secret, challenge_id|server_nonce|key|hwid|ts)` → validate challenge (exists/unexpired/unused), signature, key (active/unexpired/product-match/not-banned), HWID (bound-or-bindable, single-session) → bind/confirm HWID, activate on first use, issue **session token**, mark challenge used, log `login`, fire Discord.
+3. `files/{product}/{resource}` with the session token → decrypt the `payloads` row and return the content.
+4. `license/hwid/reset` (signed) → if cooldown elapsed, unbind + increment counter + log + alert; else reject with remaining time.
+5. `auth/heartbeat` → re-checks expiry/ban/revocation so a revoked or expired session dies live.
 
+**Consistent responses for easy client use:** every endpoint returns a uniform JSON envelope — `{ "ok": bool, "code": str, "data": {...}, "message": str }` — with coarse, stable `code` values (`ok`, `invalid_request`, `auth_failed`, `expired`, `hwid_mismatch`, `rate_limited`, `banned`). Coarse enough to avoid an enumeration oracle, uniform enough that a client switch-statement on `code` works identically in all three languages.
+
+**Client design constraints (so the deferred SDKs stay convenient & stable):** the client only computes a stable HWID, signs, and sends — zero detection logic on the client. It retries transient network/5xx errors with backoff, treats unknown `code`s gracefully, and never hard-crashes the host app on a license-server hiccup. An OpenAPI doc is auto-generated by FastAPI at `/api/v1/openapi.json` so SDKs (or codegen) can be built fast.
+
+## 7. HWID, anti-clone & server-side detection
+
+**HWID binding (first line):**
 - First successful auth binds the HWID.
 - A later auth with a different HWID → reject (`hwid_mismatch`) + `clone_attempt` audit log (severity high) + Discord alert.
-- Self-reset allowed once per cooldown (global default, e.g. 7 days, with optional per-product override).
+- Self-reset allowed once per cooldown (configurable global default, with optional per-product override — **no hardcoded number**).
 - Admin can force-reset HWID or ban a key at any time.
-- Detection heuristics produce flagged alerts: many distinct HWIDs attempted against one key; one HWID used across many keys.
+
+**Server-side detection (defeats HWID spoofing/cloning — the part the client can't fake):**
+Because HWID is client-asserted, a determined attacker can spoof it to *match* a real key. The server neutralizes this without trusting the client:
+- **One active session per key** — a new successful auth supersedes (or is rejected against) any live session. A cloned HWID therefore cannot be used **in parallel**; at most it time-shares the single seat the customer paid for.
+- **Concurrent-use detection** — overlapping heartbeats/sessions for the same key from **different IPs** ⇒ flag/ban + alert.
+- **Impossible-travel detection** — same key/HWID authenticating from geographically distant IPs faster than physically possible ⇒ flag.
+- **IP-velocity heuristic** — too many distinct IPs per key within a window ⇒ flag (a single-machine key should not roam dozens of networks).
+- **Fan-out heuristics** — many distinct HWIDs against one key, or one HWID across many keys ⇒ flag.
+
+Every threshold here (concurrency window, travel speed, max distinct IPs, time windows) lives in the `settings` table — tunable at runtime, **never hardcoded**.
+
+**Stable HWID requirement (so legit users are never wrongly locked out):**
+When the client SDKs are built, HWID must be derived from **stable** identifiers (e.g. Windows `MachineGuid`, motherboard UUID, CPU id) and must **avoid volatile** signals (current IP, RAM size, toggling/VPN adapter MACs) that change across reboots/updates and would falsely trip the clone check. This is a stability requirement, not just security.
 
 ## 8. Admin dashboard
 
 - Server-rendered (Jinja2). Single admin account **seeded from env on first boot**; password changeable from the UI.
 - Pages: **Products** (create/list/toggle), **Keys** (create single, **bulk-generate**, search by prefix/status, revoke, force-reset HWID, ban), **Logs** (filter by event type/severity/key), **Sessions** (view/revoke active sessions).
-- JSON admin API under `/admin/api/...` for automation (e.g. bulk key generation by scripts).
+- JSON admin API under a clean versioned namespace for automation (e.g. bulk key generation by scripts):
+  - `/admin/api/v1/products` (CRUD), `/admin/api/v1/keys` (list/create/bulk/search), `/admin/api/v1/keys/{id}/ban` · `/reset-hwid`, `/admin/api/v1/sessions` (list/revoke), `/admin/api/v1/logs` (query), `/admin/api/v1/settings` (read/tune thresholds — the no-hardcode control surface).
 - Session-cookie auth with CSRF; login rate-limited.
 
 ## 9. Discord notifications
@@ -101,6 +136,8 @@ Error responses use coarse, stable codes (`invalid_request`, `auth_failed`, `exp
 
 `.env` (with a committed `.env.example`, real `.env` git-ignored):
 `SERVER_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD` (hashed into the DB on first boot, then the env value can be removed), `DISCORD_WEBHOOK_URL`, `DB_PATH`, session/challenge TTLs, HWID cooldown days, rate-limit thresholds, `ENVIRONMENT` (`dev`/`prod`). Per-product `app_secret` values are generated and stored in the DB when a product is created.
+
+**No-hardcoding principle.** The env values above are only the *first-boot defaults*. At runtime every operational threshold (TTLs, cooldowns, rate limits, all the §7 detection thresholds) is read from the `settings` table and editable from the admin UI/API — so tuning the server never requires touching code or redeploying. Code reads `settings` first and falls back to the env default only if a row is absent. This keeps the server easy to operate (the "don't make the server painful" requirement).
 
 ## 11. Module layout
 
@@ -145,5 +182,5 @@ Run with uvicorn behind nginx/Caddy with **TLS terminated at the proxy (HTTPS re
 
 ## 15. Out of scope for v1 (future work)
 
-- **Client SDKs** (Lua executor loader, Windows desktop integration) — explicitly later, per the "server first" decision.
+- **Client SDKs** — explicitly later, per the "server first" decision. When built they will target **Python, Go, and Node.js**. The §6 API was designed for exactly this: pure HTTPS+JSON+HMAC-SHA256 with a uniform response envelope and an auto-generated OpenAPI spec, so each SDK is a thin, idiomatic wrapper implementable with each language's standard library. A per-OS stable-HWID recipe (§7) ships with the SDK work.
 - Reseller accounts / credit limits, multiple admin users, 2FA, Postgres migration, payment-provider integration.
