@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 
 from .. import db, security
 from ..envelope import ApiError, ok_env
-from ..models import HandshakeReq
+from ..models import HandshakeReq, VerifyReq
 from ..ratelimit import limiter
 from ..services import license as lic
 
@@ -76,3 +76,57 @@ def handshake(req: HandshakeReq, request: Request):
              int(time.time()) + ttl),
         )
     return ok_env({"challenge_id": challenge_id, "server_nonce": server_nonce, "ttl": ttl})
+
+
+@router.post("/auth/verify")
+def verify(req: VerifyReq, request: Request):
+    ip = _client_ip(request)
+    with db.db() as conn:
+        _rate_limit(conn, f"vf:{ip}")
+        _check_ts(conn, req.ts)
+        now = int(time.time())
+
+        ch = conn.execute("SELECT * FROM challenges WHERE id=?", (req.challenge_id,)).fetchone()
+        if ch is None or ch["used"] or now >= ch["expires_at"]:
+            raise ApiError(401, "auth_failed", "invalid challenge")
+        conn.execute("UPDATE challenges SET used=1 WHERE id=?", (req.challenge_id,))
+
+        key_row = lic.get_key_by_raw(conn, req.key)
+        if key_row is None or key_row["id"] != ch["key_id"]:
+            raise ApiError(401, "auth_failed", "invalid key")
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (key_row["product_id"],)).fetchone()
+
+        if not security.verify_sig(prod["app_secret"], req.answer_sig,
+                                   req.challenge_id, ch["server_nonce"], req.key, req.hwid, req.ts):
+            raise ApiError(401, "auth_failed", "bad challenge answer")
+
+        if key_row["status"] == "banned":
+            raise ApiError(403, "banned", "key banned")
+
+        if key_row["status"] == "unused":
+            lic.activate_if_new(conn, key_row, req.hwid, now)
+            key_row = lic.get_key_by_raw(conn, req.key)
+        elif key_row["hwid"] != req.hwid:
+            lic.audit(conn, "clone_attempt", key_id=key_row["id"], hwid=req.hwid, ip=ip, severity="high",
+                      detail={"bound": key_row["hwid"], "attempted": req.hwid})
+            raise ApiError(403, "hwid_mismatch", "key bound to another machine")
+
+        if lic.is_expired(key_row, now):
+            conn.execute("UPDATE license_keys SET status='expired' WHERE id=?", (key_row["id"],))
+            raise ApiError(403, "expired", "license expired")
+
+        # single active session: revoke any prior live sessions for this key
+        conn.execute("UPDATE sessions SET revoked=1 WHERE key_id=? AND revoked=0", (key_row["id"],))
+
+        token = security.new_token()
+        ttl = db.get_setting(conn, "session_ttl_seconds")
+        sess_exp = now + ttl
+        conn.execute(
+            "INSERT INTO sessions(token_hash, key_id, hwid, ip, issued_at, expires_at, revoked) "
+            "VALUES (?,?,?,?,?,?,0)",
+            (security.hash_token(token), key_row["id"], req.hwid, ip, now, sess_exp),
+        )
+        lic.audit(conn, "login", key_id=key_row["id"], hwid=req.hwid, ip=ip)
+        key_exp = key_row["expires_at"]
+    return ok_env({"token": token, "expires_at": sess_exp,
+                   "product": req.key.split("-")[0], "key_expires_at": key_exp})

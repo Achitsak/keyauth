@@ -20,6 +20,15 @@ def db():
     try:
         yield conn
         conn.commit()
+    except Exception as _exc:
+        # ApiError is an application-level handled error (e.g. hwid_mismatch with
+        # an audit row already written).  Commit so those writes persist; let the
+        # exception propagate so the HTTP handler can turn it into a response.
+        # For genuine DB / unexpected errors we intentionally skip the commit.
+        from .envelope import ApiError  # local import avoids circular dependency
+        if isinstance(_exc, ApiError):
+            conn.commit()
+        raise
     finally:
         conn.close()
 
