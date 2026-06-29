@@ -18,5 +18,14 @@ class RateLimiter:
     def reset(self):
         self._hits.clear()
 
+    def sweep(self, now: int, max_window: int) -> None:
+        cutoff = now - max_window
+        for bucket in list(self._hits.keys()):
+            q = self._hits[bucket]
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if not q:
+                del self._hits[bucket]
+
 
 limiter = RateLimiter()
