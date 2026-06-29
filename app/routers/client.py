@@ -13,6 +13,11 @@ router = APIRouter(prefix="/api/v1")
 
 @router.get("/meta/health")
 def health():
+    try:
+        with db.db() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        raise ApiError(503, "unavailable", "database not ready")
     return ok_env({"status": "alive"})
 
 

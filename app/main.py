@@ -40,6 +40,14 @@ def create_app() -> FastAPI:
             content=envelope(False, "invalid_request", None, "invalid request"),
         )
 
+    @app.exception_handler(Exception)
+    async def _unhandled_handler(request: Request, exc: Exception):
+        # 24/7: no request may crash the process; never leak internals.
+        return JSONResponse(
+            status_code=500,
+            content=envelope(False, "internal_error", None, "internal error"),
+        )
+
     app.include_router(client.router)
     return app
 
