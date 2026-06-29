@@ -39,6 +39,23 @@ def cmd_upload_payload(product, resource, path) -> int:
     return len(data)
 
 
+def cmd_reset_hwid(key: str) -> bool:
+    db.init_db()
+    with db.db() as conn:
+        k = lic.get_key_by_raw(conn, key)
+        if k is None:
+            return False
+        now = int(time.time())
+        conn.execute(
+            "UPDATE license_keys SET hwid=NULL, hwid_reset_count=hwid_reset_count+1, "
+            "last_hwid_reset_at=? WHERE id=?",
+            (now, k["id"]),
+        )
+        conn.execute("UPDATE sessions SET revoked=1 WHERE key_id=? AND revoked=0", (k["id"],))
+        lic.audit(conn, "hwid_reset_admin", key_id=k["id"])
+    return True
+
+
 def cmd_create_key(product, days, count=1, note="") -> list[str]:
     db.init_db()
     out = []
@@ -74,6 +91,9 @@ def main(argv=None):
     up.add_argument("--resource", required=True)
     up.add_argument("--file", required=True)
 
+    rh = sub.add_parser("reset-hwid")
+    rh.add_argument("--key", required=True)
+
     args = parser.parse_args(argv)
     if args.cmd == "seed-admin":
         print("created" if seed_admin() else "admin already exists")
@@ -86,6 +106,8 @@ def main(argv=None):
     elif args.cmd == "upload-payload":
         n = cmd_upload_payload(args.product, args.resource, args.file)
         print(f"uploaded {n} bytes to {args.product}/{args.resource}")
+    elif args.cmd == "reset-hwid":
+        print("reset" if cmd_reset_hwid(args.key) else "unknown key")
 
 
 if __name__ == "__main__":
