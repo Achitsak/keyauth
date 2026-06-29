@@ -12,7 +12,8 @@ def create_product(conn, slug, name, key_prefix, cooldown_days=None):
         "hwid_reset_cooldown_days, active, created_at) VALUES (?,?,?,?,?,1,?)",
         (slug, name, key_prefix, app_secret, cooldown_days, now),
     )
-    return get_product(conn, slug)
+    row = get_product(conn, slug)
+    return dict(row) if row is not None else None
 
 
 def get_product(conn, slug):
@@ -47,7 +48,7 @@ def activate_if_new(conn, key_row, hwid, now) -> None:
     if key_row["status"] == "unused":
         conn.execute(
             "UPDATE license_keys SET status='active', hwid=?, hwid_set_at=?, "
-            "activated_at=?, expires_at=? WHERE id=?",
+            "activated_at=?, expires_at=? WHERE id=? AND status='unused'",
             (hwid, now, now, now + key_row["duration_seconds"], key_row["id"]),
         )
 
