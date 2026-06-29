@@ -1,12 +1,14 @@
 import time
 
 from fastapi import APIRouter, Request
+from fastapi.responses import Response
 
-from .. import db, security
+from .. import db, security, payload_crypto
 from ..envelope import ApiError, ok_env
 from ..models import HandshakeReq, VerifyReq, HwidResetReq
 from ..ratelimit import limiter
 from ..services import license as lic
+from ..services import payload as pl
 
 router = APIRouter(prefix="/api/v1")
 
@@ -228,3 +230,25 @@ def hwid_reset(req: HwidResetReq, request: Request):
         # revoke live sessions so the old machine drops
         conn.execute("UPDATE sessions SET revoked=1 WHERE key_id=? AND revoked=0", (k["id"],))
     return ok_env({"reset": True, "reset_count": new_count})
+
+
+@router.get("/files/{product}/{resource}")
+def get_file(product: str, resource: str, request: Request):
+    with db.db() as conn:
+        sess = _authed_session(conn, request)
+        k = conn.execute("SELECT * FROM license_keys WHERE id=?", (sess["key_id"],)).fetchone()
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (k["product_id"],)).fetchone()
+        if prod is None or prod["slug"] != product:
+            raise ApiError(403, "auth_failed", "key not valid for this product")
+        if k["status"] == "banned":
+            raise ApiError(403, "banned", "key banned")
+        if lic.is_expired(k, int(time.time())):
+            conn.execute("UPDATE license_keys SET status='expired' WHERE id=?", (k["id"],))
+            raise ApiError(403, "expired", "license expired")
+        row = pl.get_payload(conn, prod["id"], resource)
+        if row is None:
+            raise ApiError(404, "not_found", "resource not found")
+        plaintext = payload_crypto.decrypt_payload(row["ciphertext"], row["nonce"])
+        lic.audit(conn, "payload_fetch", key_id=k["id"], hwid=sess["hwid"], ip=_client_ip(request),
+                  detail={"resource": resource})
+    return Response(content=plaintext, media_type="application/octet-stream")
