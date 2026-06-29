@@ -10,6 +10,7 @@ from ..models import HandshakeReq, VerifyReq, HwidResetReq
 from ..ratelimit import limiter
 from ..services import license as lic
 from ..services import payload as pl
+from ..services import detection as det
 
 router = APIRouter(prefix="/api/v1")
 
@@ -148,6 +149,10 @@ def heartbeat(request: Request):
             lic.audit(conn, "ip_change", key_id=k["id"], hwid=sess["hwid"], ip=_client_ip(request),
                       detail={"session_ip": sess["ip"]})
         record_access(conn, k["id"], _client_ip(request), sess["hwid"], "heartbeat")
+        try:
+            det.check_clone(conn, k["id"], int(time.time()))
+        except Exception:
+            pass
         exp = k["expires_at"]
     return ok_env({"valid": True, "key_expires_at": exp})
 
@@ -214,6 +219,10 @@ def verify(req: VerifyReq, request: Request):
         )
         lic.audit(conn, "login", key_id=key_row["id"], hwid=req.hwid, ip=ip)
         record_access(conn, key_row["id"], ip, req.hwid, "auth")
+        try:
+            det.check_clone(conn, key_row["id"], now)
+        except Exception:
+            pass
         key_exp = key_row["expires_at"]
         product_slug = prod["slug"]
     return ok_env({"token": token, "expires_at": sess_exp,
