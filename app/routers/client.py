@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 
 from .. import db, security
 from ..envelope import ApiError, ok_env
-from ..models import HandshakeReq, VerifyReq
+from ..models import HandshakeReq, VerifyReq, HwidResetReq
 from ..ratelimit import limiter
 from ..services import license as lic
 
@@ -153,6 +153,10 @@ def verify(req: VerifyReq, request: Request):
         if key_row["status"] == "unused":
             lic.activate_if_new(conn, key_row, req.hwid, now)
             key_row = lic.get_key_by_raw(conn, req.key)
+        elif key_row["hwid"] is None:
+            conn.execute("UPDATE license_keys SET hwid=?, hwid_set_at=? WHERE id=?",
+                         (req.hwid, now, key_row["id"]))
+            key_row = lic.get_key_by_raw(conn, req.key)
         elif key_row["hwid"] != req.hwid:
             lic.audit(conn, "clone_attempt", key_id=key_row["id"], hwid=req.hwid, ip=ip, severity="high",
                       detail={"bound": key_row["hwid"], "attempted": req.hwid})
@@ -177,3 +181,43 @@ def verify(req: VerifyReq, request: Request):
         key_exp = key_row["expires_at"]
     return ok_env({"token": token, "expires_at": sess_exp,
                    "product": req.key.split("-")[0], "key_expires_at": key_exp})
+
+
+@router.post("/license/hwid/reset")
+def hwid_reset(req: HwidResetReq, request: Request):
+    ip = _client_ip(request)
+    with db.db() as conn:
+        _rate_limit(conn, f"rs:{ip}")
+        _check_ts(conn, req.ts)
+        prod = lic.get_product(conn, req.product)
+        if prod is None or not prod["active"]:
+            raise ApiError(401, "auth_failed", "unknown product")
+        if not security.verify_sig(prod["app_secret"], req.sig,
+                                   req.product, req.key, req.hwid, req.nonce, req.ts):
+            raise ApiError(401, "auth_failed", "bad signature")
+        _consume_nonce(conn, req.nonce)
+        k = lic.get_key_by_raw(conn, req.key)
+        if k is None:
+            raise ApiError(401, "auth_failed", "invalid key")
+
+        now = int(time.time())
+        if prod["hwid_reset_cooldown_days"] is not None:
+            cooldown_days = prod["hwid_reset_cooldown_days"]
+        else:
+            cooldown_days = db.get_setting(conn, "hwid_reset_cooldown_days")
+        cooldown = cooldown_days * 86400
+        last = k["last_hwid_reset_at"]
+        if last is not None and now - last < cooldown:
+            remaining = cooldown - (now - last)
+            raise ApiError(429, "cooldown", f"{remaining} seconds remaining")
+
+        conn.execute(
+            "UPDATE license_keys SET hwid=NULL, hwid_reset_count=hwid_reset_count+1, "
+            "last_hwid_reset_at=? WHERE id=?", (now, k["id"]))
+        # status is unchanged: an 'active' key stays active so its timer keeps running;
+        # the next auth/verify re-binds the new HWID via the "hwid is None" branch.
+        new_count = k["hwid_reset_count"] + 1
+        lic.audit(conn, "hwid_reset", key_id=k["id"], hwid=req.hwid, ip=ip)
+        # revoke live sessions so the old machine drops
+        conn.execute("UPDATE sessions SET revoked=1 WHERE key_id=? AND revoked=0", (k["id"],))
+    return ok_env({"reset": True, "reset_count": new_count})
