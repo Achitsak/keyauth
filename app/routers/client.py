@@ -1,18 +1,27 @@
 import time
 
 from fastapi import APIRouter, Request
+from fastapi.responses import Response
 
-from .. import db, security
+from .. import db, security, payload_crypto
+from ..config import settings
 from ..envelope import ApiError, ok_env
 from ..models import HandshakeReq, VerifyReq, HwidResetReq
 from ..ratelimit import limiter
 from ..services import license as lic
+from ..services import payload as pl
+from ..services import detection as det
 
 router = APIRouter(prefix="/api/v1")
 
 
 @router.get("/meta/health")
 def health():
+    try:
+        with db.db() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        raise ApiError(503, "unavailable", "database not ready")
     return ok_env({"status": "alive"})
 
 
@@ -22,7 +31,33 @@ def server_time():
 
 
 def _client_ip(request: Request) -> str:
+    if settings.trust_proxy:
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            # Real client IP is the entry our trusted proxy appended (right-most for a
+            # single proxy); left-most entries are client-supplied and spoofable.
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                idx = max(0, len(parts) - settings.trusted_proxy_hops)
+                return parts[idx]
     return request.client.host if request.client else "0.0.0.0"
+
+
+def record_access(conn, key_id, ip, hwid, kind) -> None:
+    conn.execute(
+        "INSERT INTO access_events(key_id, ip, hwid, ts, kind) VALUES (?,?,?,?,?)",
+        (key_id, ip, hwid, int(time.time()), kind),
+    )
+
+
+def _prune_ephemeral(conn, now: int) -> None:
+    # Bounded growth for 24/7 uptime. Cheap, indexed DELETEs.
+    nonce_age = db.get_setting(conn, "nonce_prune_seconds")
+    ev_age = db.get_setting(conn, "clone_ip_window_seconds")
+    conn.execute("DELETE FROM challenges WHERE expires_at < ?", (now,))
+    conn.execute("DELETE FROM used_nonces WHERE seen_at < ?", (now - nonce_age,))
+    conn.execute("DELETE FROM access_events WHERE ts < ?", (now - ev_age,))
+    limiter.sweep(now, max_window=max(ev_age, 3600))
 
 
 def _check_ts(conn, ts: int) -> None:
@@ -53,6 +88,7 @@ def _rate_limit(conn, bucket: str) -> None:
 def handshake(req: HandshakeReq, request: Request):
     ip = _client_ip(request)
     with db.db() as conn:
+        _prune_ephemeral(conn, int(time.time()))
         _rate_limit(conn, f"hs:{ip}")
         _check_ts(conn, req.ts)
         prod = lic.get_product(conn, req.product)
@@ -65,6 +101,8 @@ def handshake(req: HandshakeReq, request: Request):
         key_row = lic.get_key_by_raw(conn, req.key)
         if key_row is None:
             raise ApiError(401, "auth_failed", "invalid key")
+        if key_row["status"] == "banned":
+            raise ApiError(403, "banned", "key banned")
 
         challenge_id = security.new_token()
         server_nonce = security.new_nonce()
@@ -114,6 +152,14 @@ def heartbeat(request: Request):
         if lic.is_expired(k, int(time.time())):
             conn.execute("UPDATE license_keys SET status='expired' WHERE id=?", (k["id"],))
             raise ApiError(403, "expired", "license expired")
+        if sess["ip"] != _client_ip(request):
+            lic.audit(conn, "ip_change", key_id=k["id"], hwid=sess["hwid"], ip=_client_ip(request),
+                      detail={"session_ip": sess["ip"]})
+        try:
+            record_access(conn, k["id"], _client_ip(request), sess["hwid"], "heartbeat")
+            det.check_clone(conn, k["id"], int(time.time()))
+        except Exception:
+            pass
         exp = k["expires_at"]
     return ok_env({"valid": True, "key_expires_at": exp})
 
@@ -179,6 +225,11 @@ def verify(req: VerifyReq, request: Request):
             (security.hash_token(token), key_row["id"], req.hwid, ip, now, sess_exp),
         )
         lic.audit(conn, "login", key_id=key_row["id"], hwid=req.hwid, ip=ip)
+        try:
+            record_access(conn, key_row["id"], ip, req.hwid, "auth")
+            det.check_clone(conn, key_row["id"], now)
+        except Exception:
+            pass
         key_exp = key_row["expires_at"]
         product_slug = prod["slug"]
     return ok_env({"token": token, "expires_at": sess_exp,
@@ -223,3 +274,25 @@ def hwid_reset(req: HwidResetReq, request: Request):
         # revoke live sessions so the old machine drops
         conn.execute("UPDATE sessions SET revoked=1 WHERE key_id=? AND revoked=0", (k["id"],))
     return ok_env({"reset": True, "reset_count": new_count})
+
+
+@router.get("/files/{product}/{resource}")
+def get_file(product: str, resource: str, request: Request):
+    with db.db() as conn:
+        sess = _authed_session(conn, request)
+        k = conn.execute("SELECT * FROM license_keys WHERE id=?", (sess["key_id"],)).fetchone()
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (k["product_id"],)).fetchone()
+        if prod is None or prod["slug"] != product:
+            raise ApiError(403, "auth_failed", "key not valid for this product")
+        if k["status"] == "banned":
+            raise ApiError(403, "banned", "key banned")
+        if lic.is_expired(k, int(time.time())):
+            conn.execute("UPDATE license_keys SET status='expired' WHERE id=?", (k["id"],))
+            raise ApiError(403, "expired", "license expired")
+        row = pl.get_payload(conn, prod["id"], resource)
+        if row is None:
+            raise ApiError(404, "not_found", "resource not found")
+        plaintext = payload_crypto.decrypt_payload(row["ciphertext"], row["nonce"])
+        lic.audit(conn, "payload_fetch", key_id=k["id"], hwid=sess["hwid"], ip=_client_ip(request),
+                  detail={"resource": resource})
+    return Response(content=plaintext, media_type="application/octet-stream")

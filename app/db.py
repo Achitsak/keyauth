@@ -19,6 +19,11 @@ def db():
     conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={settings.db_busy_timeout_ms}")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-8000")
+    conn.execute("PRAGMA mmap_size=268435456")
     try:
         yield conn
         conn.commit()
@@ -115,15 +120,25 @@ CREATE TABLE IF NOT EXISTS payloads (
     created_at INTEGER NOT NULL,
     UNIQUE(product_id, resource_slug)
 );
+CREATE TABLE IF NOT EXISTS access_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id INTEGER NOT NULL REFERENCES license_keys(id),
+    ip TEXT NOT NULL,
+    hwid TEXT,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_challenges_exp ON challenges(expires_at);
 CREATE INDEX IF NOT EXISTS idx_nonce_seen ON used_nonces(seen_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_key ON sessions(key_id);
+CREATE INDEX IF NOT EXISTS idx_access_key_ts ON access_events(key_id, ts);
 """
 
 
 def init_db() -> None:
     with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         now = int(time.time())
         for key, value in SETTINGS_DEFAULTS.items():
