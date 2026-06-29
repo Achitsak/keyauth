@@ -1526,9 +1526,8 @@ def hwid_reset(req: HwidResetReq, request: Request):
         conn.execute(
             "UPDATE license_keys SET hwid=NULL, hwid_reset_count=hwid_reset_count+1, "
             "last_hwid_reset_at=? WHERE id=?", (now, k["id"]))
-        # if the key was active and bound, keep it active so the next verify re-binds
-        if k["status"] == "active":
-            conn.execute("UPDATE license_keys SET status='active' WHERE id=?", (k["id"],))
+        # status is unchanged: an 'active' key stays active so its timer keeps running;
+        # the next auth/verify re-binds the new HWID via the "hwid is None" branch.
         new_count = k["hwid_reset_count"] + 1
         lic.audit(conn, "hwid_reset", key_id=k["id"], hwid=req.hwid, ip=ip)
         # revoke live sessions so the old machine drops
