@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     admin_password: str = "change-me-on-first-boot"
     discord_webhook_url: str = ""
     environment: str = "dev"
+    db_busy_timeout_ms: int = 5000
 
 
 settings = Settings()

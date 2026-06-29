@@ -19,6 +19,11 @@ def db():
     conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={settings.db_busy_timeout_ms}")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-8000")
+    conn.execute("PRAGMA mmap_size=268435456")
     try:
         yield conn
         conn.commit()
@@ -124,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_key ON sessions(key_id);
 
 def init_db() -> None:
     with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         now = int(time.time())
         for key, value in SETTINGS_DEFAULTS.items():
