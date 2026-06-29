@@ -18,7 +18,7 @@ def test_client_ip_direct_vs_proxy():
     assert c._client_ip(_req("1.2.3.4", xff="9.9.9.9, 8.8.8.8")) == "1.2.3.4"
     settings.trust_proxy = True
     try:
-        assert c._client_ip(_req("1.2.3.4", xff="9.9.9.9, 8.8.8.8")) == "9.9.9.9"
+        assert c._client_ip(_req("1.2.3.4", xff="9.9.9.9, 8.8.8.8")) == "8.8.8.8"
     finally:
         settings.trust_proxy = False
 

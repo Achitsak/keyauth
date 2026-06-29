@@ -34,7 +34,12 @@ def _client_ip(request: Request) -> str:
     if settings.trust_proxy:
         xff = request.headers.get("X-Forwarded-For")
         if xff:
-            return xff.split(",")[0].strip()
+            # Real client IP is the entry our trusted proxy appended (right-most for a
+            # single proxy); left-most entries are client-supplied and spoofable.
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                idx = max(0, len(parts) - settings.trusted_proxy_hops)
+                return parts[idx]
     return request.client.host if request.client else "0.0.0.0"
 
 
@@ -150,8 +155,8 @@ def heartbeat(request: Request):
         if sess["ip"] != _client_ip(request):
             lic.audit(conn, "ip_change", key_id=k["id"], hwid=sess["hwid"], ip=_client_ip(request),
                       detail={"session_ip": sess["ip"]})
-        record_access(conn, k["id"], _client_ip(request), sess["hwid"], "heartbeat")
         try:
+            record_access(conn, k["id"], _client_ip(request), sess["hwid"], "heartbeat")
             det.check_clone(conn, k["id"], int(time.time()))
         except Exception:
             pass
@@ -220,8 +225,8 @@ def verify(req: VerifyReq, request: Request):
             (security.hash_token(token), key_row["id"], req.hwid, ip, now, sess_exp),
         )
         lic.audit(conn, "login", key_id=key_row["id"], hwid=req.hwid, ip=ip)
-        record_access(conn, key_row["id"], ip, req.hwid, "auth")
         try:
+            record_access(conn, key_row["id"], ip, req.hwid, "auth")
             det.check_clone(conn, key_row["id"], now)
         except Exception:
             pass

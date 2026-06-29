@@ -90,6 +90,6 @@ docker compose logs -f keyauth
 ```
 
 - The SQLite database (and its WAL sidecars) live in the `keyauth-data` volume and survive restarts/redeploys.
-- `restart: always` + the healthcheck mean the container self-heals on crash.
+- `restart: always` restarts the container if the process **crashes or exits**. Note: plain `docker compose` does NOT restart a container that is merely **unhealthy** (still running) — for that, use an orchestrator (Docker Swarm / Kubernetes) or an autoheal sidecar. The healthcheck status is still visible via `docker compose ps` for monitoring/alerting.
 - **Backup:** `docker compose exec keyauth sh -c "sqlite3 /data/keyauth.db '.backup /data/backup.db'"` (or stop briefly and copy `/data`).
 - **Scale-out (future):** for true multi-instance HA, migrate SQLite → PostgreSQL and move rate-limit/nonce/session state to Redis; then run N replicas behind the proxy.

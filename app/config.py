@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     environment: str = "dev"
     db_busy_timeout_ms: int = 5000
     trust_proxy: bool = False
+    trusted_proxy_hops: int = 1
 
 
 settings = Settings()
