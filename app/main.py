@@ -12,6 +12,8 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _startup():
         init_db()
+        from .cli import seed_admin
+        seed_admin()
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(request: Request, exc: ApiError):
