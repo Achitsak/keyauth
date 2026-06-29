@@ -34,8 +34,6 @@ def verify_password(pw: str, hashed: str) -> bool:
         return _ph.verify(hashed, pw)
     except VerifyMismatchError:
         return False
-    except Exception:
-        return False
 
 
 def new_token() -> str:
@@ -60,4 +58,4 @@ def sign(secret: str, *fields) -> str:
 
 def verify_sig(secret: str, sig: str, *fields) -> bool:
     expected = sign(secret, *fields)
-    return hmac.compare_digest(expected, sig or "")
+    return hmac.compare_digest(expected.encode(), (sig or "").encode())

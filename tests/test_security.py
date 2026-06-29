@@ -8,6 +8,7 @@ def test_generate_key_format():
     assert len(parts) == 5
     assert all(len(p) == 5 for p in parts[1:])
     assert s.generate_key("MASTERP") != s.generate_key("MASTERP")
+    assert all(c in s._CROCKFORD for part in parts[1:] for c in part)
 
 
 def test_hash_key_stable_and_hex():
