@@ -80,9 +80,10 @@ def handshake(req: HandshakeReq, request: Request):
 
 def _authed_session(conn, request: Request):
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    parts = auth.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
         raise ApiError(401, "auth_failed", "missing token")
-    token = auth[7:]
+    token = parts[1]
     sess = conn.execute(
         "SELECT * FROM sessions WHERE token_hash=?", (security.hash_token(token),)
     ).fetchone()
@@ -179,8 +180,9 @@ def verify(req: VerifyReq, request: Request):
         )
         lic.audit(conn, "login", key_id=key_row["id"], hwid=req.hwid, ip=ip)
         key_exp = key_row["expires_at"]
+        product_slug = prod["slug"]
     return ok_env({"token": token, "expires_at": sess_exp,
-                   "product": req.key.split("-")[0], "key_expires_at": key_exp})
+                   "product": product_slug, "key_expires_at": key_exp})
 
 
 @router.post("/license/hwid/reset")

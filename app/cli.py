@@ -1,4 +1,5 @@
 import argparse
+import time
 
 from . import db, security
 from .config import settings
@@ -11,7 +12,6 @@ def seed_admin() -> bool:
         exists = conn.execute("SELECT 1 FROM admins LIMIT 1").fetchone()
         if exists:
             return False
-        import time
         conn.execute(
             "INSERT INTO admins(username, password_hash, created_at) VALUES (?,?,?)",
             (settings.admin_username, security.hash_password(settings.admin_password), int(time.time())),

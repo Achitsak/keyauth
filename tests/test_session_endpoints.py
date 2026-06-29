@@ -51,3 +51,35 @@ def test_revoked_session_rejected():
         conn.execute("UPDATE sessions SET revoked=1")
     r = client.get("/api/v1/license", headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 401
+
+
+def test_heartbeat_banned():
+    secret, raw = _bootstrap()
+    client = TestClient(create_app())
+    tok = _token(client, secret, raw)
+    with db.db() as conn:
+        conn.execute("UPDATE license_keys SET status='banned'")
+    r = client.post("/api/v1/auth/heartbeat", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 403 and r.json()["code"] == "banned"
+
+
+def test_heartbeat_expired_persists_status():
+    secret, raw = _bootstrap()
+    client = TestClient(create_app())
+    tok = _token(client, secret, raw)
+    with db.db() as conn:
+        conn.execute("UPDATE license_keys SET expires_at=1")
+    r = client.post("/api/v1/auth/heartbeat", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 403 and r.json()["code"] == "expired"
+    with db.db() as conn:
+        st = conn.execute("SELECT status FROM license_keys LIMIT 1").fetchone()["status"]
+    assert st == "expired"
+
+
+def test_logout_revokes_session():
+    secret, raw = _bootstrap()
+    client = TestClient(create_app())
+    tok = _token(client, secret, raw)
+    h = {"Authorization": f"Bearer {tok}"}
+    assert client.delete("/api/v1/auth/session", headers=h).json()["data"]["revoked"] is True
+    assert client.get("/api/v1/license", headers=h).status_code == 401

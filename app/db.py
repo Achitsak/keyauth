@@ -3,6 +3,7 @@ import sqlite3
 import time
 
 from .config import settings, SETTINGS_DEFAULTS
+from .envelope import ApiError
 
 _DB_PATH = settings.db_path
 
@@ -14,20 +15,20 @@ def set_db_path(path: str) -> None:
 
 @contextlib.contextmanager
 def db():
+    """Yield a SQLite connection. Commits on clean exit AND on ApiError (so single-use/audit/state writes made before a handled error persist); rolls back on any other exception. Always closes."""
     conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
         conn.commit()
-    except Exception as _exc:
-        # ApiError is an application-level handled error (e.g. hwid_mismatch with
-        # an audit row already written).  Commit so those writes persist; let the
-        # exception propagate so the HTTP handler can turn it into a response.
-        # For genuine DB / unexpected errors we intentionally skip the commit.
-        from .envelope import ApiError  # local import avoids circular dependency
-        if isinstance(_exc, ApiError):
+    except ApiError:
+        try:
             conn.commit()
+        except Exception:
+            pass
+        raise
+    except Exception:
         raise
     finally:
         conn.close()

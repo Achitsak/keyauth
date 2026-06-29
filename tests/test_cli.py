@@ -1,4 +1,4 @@
-from app import db, cli, security
+from app import db, cli
 
 
 def test_seed_admin_idempotent():

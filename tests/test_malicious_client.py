@@ -39,7 +39,9 @@ def test_replayed_handshake_is_rejected():
     sig = security.sign(secret, "manager", raw, "HW1", nonce, ts)
     body = {"product": "manager", "key": raw, "hwid": "HW1", "nonce": nonce, "ts": ts, "sig": sig}
     assert client.post("/api/v1/auth/handshake", json=body).json()["ok"] is True
-    assert client.post("/api/v1/auth/handshake", json=body).json()["code"] == "invalid_request"
+    r2 = client.post("/api/v1/auth/handshake", json=body)
+    assert r2.status_code == 400
+    assert r2.json()["code"] == "invalid_request"
 
 
 def test_replayed_challenge_answer_is_rejected():
@@ -51,7 +53,9 @@ def test_replayed_challenge_answer_is_rejected():
     body = {"challenge_id": hs["challenge_id"], "key": raw, "hwid": "HW1", "ts": ts2, "answer_sig": answer}
     assert client.post("/api/v1/auth/verify", json=body).json()["ok"] is True
     # reusing the same challenge again must fail (single-use)
-    assert client.post("/api/v1/auth/verify", json=body).status_code == 401
+    r = client.post("/api/v1/auth/verify", json=body)
+    assert r.status_code == 401
+    assert r.json()["code"] == "auth_failed"
 
 
 def test_cloned_hwid_cannot_run_in_parallel():
@@ -68,8 +72,9 @@ def test_cloned_hwid_cannot_run_in_parallel():
     hs2 = _handshake(client, secret, raw, hwid="HW1").json()["data"]
     ts2 = int(time.time())
     ans2 = security.sign(secret, hs2["challenge_id"], hs2["server_nonce"], raw, "HW1", ts2)
-    client.post("/api/v1/auth/verify", json={
+    sv = client.post("/api/v1/auth/verify", json={
         "challenge_id": hs2["challenge_id"], "key": raw, "hwid": "HW1", "ts": ts2, "answer_sig": ans2})
+    assert sv.json()["ok"] is True
     # original token is now revoked -> parallel use impossible
     r = client.get("/api/v1/license", headers={"Authorization": f"Bearer {tok1}"})
     assert r.status_code == 401
