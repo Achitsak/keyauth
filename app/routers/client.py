@@ -96,6 +96,8 @@ def handshake(req: HandshakeReq, request: Request):
         key_row = lic.get_key_by_raw(conn, req.key)
         if key_row is None:
             raise ApiError(401, "auth_failed", "invalid key")
+        if key_row["status"] == "banned":
+            raise ApiError(403, "banned", "key banned")
 
         challenge_id = security.new_token()
         server_nonce = security.new_nonce()
