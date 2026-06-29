@@ -77,3 +77,19 @@ Includes `tests/test_malicious_client.py` — an adversarial suite proving the s
 
 Design spec: [`docs/superpowers/specs/2026-06-29-license-key-server-design.md`](docs/superpowers/specs/2026-06-29-license-key-server-design.md)
 Phase 1 plan: [`docs/superpowers/plans/2026-06-29-license-server-phase1-foundation.md`](docs/superpowers/plans/2026-06-29-license-server-phase1-foundation.md)
+
+## Deployment (24/7, Docker)
+
+Single robust instance with auto-restart. Run behind nginx/Caddy with TLS terminated.
+
+```bash
+cp .env.example .env   # set SERVER_SECRET, ADMIN_PASSWORD, etc.
+docker compose up -d --build
+docker compose ps      # healthcheck should show "healthy"
+docker compose logs -f keyauth
+```
+
+- The SQLite database (and its WAL sidecars) live in the `keyauth-data` volume and survive restarts/redeploys.
+- `restart: always` + the healthcheck mean the container self-heals on crash.
+- **Backup:** `docker compose exec keyauth sh -c "sqlite3 /data/keyauth.db '.backup /data/backup.db'"` (or stop briefly and copy `/data`).
+- **Scale-out (future):** for true multi-instance HA, migrate SQLite → PostgreSQL and move rate-limit/nonce/session state to Redis; then run N replicas behind the proxy.
