@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
     environment: str = "dev"
     db_busy_timeout_ms: int = 5000
+    trust_proxy: bool = False
 
 
 settings = Settings()
@@ -24,4 +25,8 @@ SETTINGS_DEFAULTS: dict[str, int] = {
     "hwid_reset_cooldown_days": 7,
     "rate_limit_auth_per_min": 10,
     "nonce_prune_seconds": 120,
+    "clone_ip_window_seconds": 3600,
+    "clone_max_ips": 3,
+    "clone_concurrent_window_seconds": 120,
+    "clone_flag_cooldown_seconds": 600,
 }
